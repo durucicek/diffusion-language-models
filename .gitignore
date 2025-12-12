@@ -1,0 +1,41 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data and results (large files)
+*.json
+!**/config*.json
+data_creation/data/wikipedia_samples.json
+data_creation/results/
+
+# Model cache
+.cache/
+*.pt
+*.bin
+*.safetensors
+
+# HuggingFace cache
+huggingface/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
