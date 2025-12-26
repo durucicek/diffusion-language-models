@@ -1,8 +1,4 @@
-"""
-LLaDA 8B inference pipeline.
-
-LLaDA is a masked diffusion language model that uses iterative denoising.
-"""
+# pipelines/llada_pipeline.py
 
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -10,15 +6,15 @@ from typing import Optional
 
 from .base_pipeline import BasePipeline
 
-
 class LLaDAGenerate:
     """
     Generation helper for LLaDA model.
-    
+
     Implements the masked diffusion generation process.
     """
-    
+
     @staticmethod
+    @torch.no_grad()
     def generate(
         model,
         tokenizer,
@@ -29,195 +25,195 @@ class LLaDAGenerate:
         temperature: float = 1.0,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
-        cfg_scale: float = 1.0,
+        cfg_scale: float = 1.0,  # kept for API compatibility, not used here
         remasking: str = "low_confidence",
-        device: str = "cuda"
+        device: str = "cuda",
     ) -> torch.Tensor:
-        """
-        Generate text using LLaDA's masked diffusion process.
-        
-        Args:
-            model: LLaDA model
-            tokenizer: LLaDA tokenizer
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            max_new_tokens: Maximum tokens to generate
-            steps: Number of diffusion steps
-            temperature: Sampling temperature
-            top_p: Top-p sampling
-            top_k: Top-k sampling
-            cfg_scale: Classifier-free guidance scale
-            remasking: Remasking strategy
-            device: Device
-            
-        Returns:
-            Generated token IDs
-        """
-        batch_size = input_ids.shape[0]
-        prompt_length = input_ids.shape[1]
-        
-        # Get mask token ID
-        mask_token_id = tokenizer.mask_token_id
+        batch_size, prompt_length = input_ids.shape
+
+        # Prefer model.config.mask_token_id, then tokenizer, then <|mdm_mask|>, then unk
+        mask_token_id = getattr(getattr(model, "config", None), "mask_token_id", None)
+        if mask_token_id is None and getattr(tokenizer, "mask_token_id", None) is not None:
+            mask_token_id = tokenizer.mask_token_id
         if mask_token_id is None:
-            # Fallback for models without explicit mask token
-            mask_token_id = tokenizer.unk_token_id
-        
-        # Initialize with mask tokens for generation
+            try:
+                mask_token_id = tokenizer.convert_tokens_to_ids("<|mdm_mask|>")
+            except Exception:
+                mask_token_id = tokenizer.unk_token_id
+
         gen_length = max_new_tokens
+
+        # Start with all-mask tokens for the generation region
         masked_tokens = torch.full(
             (batch_size, gen_length),
             mask_token_id,
             dtype=torch.long,
-            device=device
+            device=device,
         )
-        
-        # Concatenate prompt with masked tokens
+
+        # [prompt | gen_section]
         current_ids = torch.cat([input_ids, masked_tokens], dim=1)
-        current_mask = torch.cat([
-            attention_mask,
-            torch.ones((batch_size, gen_length), dtype=torch.long, device=device)
-        ], dim=1)
-        
-        # Iterative denoising
+        current_mask = torch.cat(
+            [
+                attention_mask,
+                torch.ones((batch_size, gen_length), dtype=torch.long, device=device),
+            ],
+            dim=1,
+        )
+
+        steps = max(1, steps)
         tokens_per_step = max(1, gen_length // steps)
-        
+
         for step in range(steps):
-            with torch.no_grad():
-                outputs = model(
-                    input_ids=current_ids,
-                    attention_mask=current_mask
-                )
-                logits = outputs.logits
-            
-            # Only consider positions after the prompt
-            gen_logits = logits[:, prompt_length:, :]
-            
-            # Apply temperature
+            outputs = model(
+                input_ids=current_ids,
+                attention_mask=current_mask,
+            )
+            logits = outputs.logits  # (B, prompt+gen, V)
+
+            # Only scores for generation part
+            gen_logits = logits[:, prompt_length:, :]  # (B, gen_len, V)
+
+            # Temperature
             if temperature > 0:
                 gen_logits = gen_logits / temperature
-            
-            # Apply top-p sampling
-            if top_p is not None and top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(gen_logits, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # Top-p (nucleus) sampling
+            if top_p is not None and 0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(
+                    gen_logits, descending=True, dim=-1
+                )
+                probs_sorted = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(probs_sorted, dim=-1)
+
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                    ..., :-1
+                ].clone()
                 sorted_indices_to_remove[..., 0] = 0
-                
+
+                # Zero-out logits beyond the nucleus
+                # (no aliasing issue here: we write constants)
                 for b in range(batch_size):
                     for t in range(gen_length):
-                        indices_to_remove = sorted_indices[b, t, sorted_indices_to_remove[b, t]]
-                        gen_logits[b, t, indices_to_remove] = float('-inf')
-            
-            # Apply top-k sampling
+                        idx_remove = sorted_indices[b, t, sorted_indices_to_remove[b, t]]
+                        gen_logits[b, t, idx_remove] = float("-inf")
+
+            # Top-k
             if top_k is not None:
-                top_k_logits, _ = torch.topk(gen_logits, min(top_k, gen_logits.size(-1)), dim=-1)
+                k = min(top_k, gen_logits.size(-1))
+                top_k_logits, _ = torch.topk(gen_logits, k, dim=-1)
                 min_top_k = top_k_logits[..., -1].unsqueeze(-1)
-                gen_logits = torch.where(gen_logits < min_top_k, float('-inf'), gen_logits)
-            
-            # Sample from distribution
+                gen_logits = torch.where(
+                    gen_logits < min_top_k, float("-inf"), gen_logits
+                )
+
+            # Sample from logits
             probs = torch.softmax(gen_logits, dim=-1)
-            sampled_tokens = torch.multinomial(
-                probs.view(-1, probs.size(-1)),
-                num_samples=1
-            ).view(batch_size, gen_length)
-            
-            # Calculate confidence for remasking
-            max_probs, _ = probs.max(dim=-1)
-            
-            # Find masked positions
-            gen_section = current_ids[:, prompt_length:]
-            is_masked = (gen_section == mask_token_id)
-            
+            # Flatten for multinomial then reshape back
+            probs_flat = probs.reshape(-1, probs.size(-1)).contiguous()
+            sampled_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
+            sampled_tokens = sampled_flat.view(batch_size, gen_length)
+
+            # Confidence scores per position
+            max_probs, _ = probs.max(dim=-1)  # (B, gen_len)
+
+            # Work on a *separate* buffer, not a view into current_ids
+            gen_section = current_ids[:, prompt_length:].clone()
+            is_masked = gen_section == mask_token_id
+
             if not is_masked.any():
                 break
-            
-            # Determine which tokens to unmask based on remasking strategy
+
+            num_to_unmask = min(tokens_per_step, is_masked.sum().item())
+            if num_to_unmask <= 0:
+                break
+
             if remasking == "low_confidence":
-                # Unmask tokens with highest confidence
+                # Unmask tokens with highest confidence among still-masked positions
                 confidence = max_probs.clone()
-                confidence[~is_masked] = -float('inf')
-                
-                num_to_unmask = min(tokens_per_step, is_masked.sum().item())
-                if num_to_unmask > 0:
-                    _, top_indices = torch.topk(
-                        confidence.view(-1),
-                        k=num_to_unmask
-                    )
-                    
-                    flat_gen = gen_section.view(-1)
-                    flat_sampled = sampled_tokens.view(-1)
-                    flat_gen[top_indices] = flat_sampled[top_indices]
-                    current_ids[:, prompt_length:] = flat_gen.view(batch_size, gen_length)
+                confidence[~is_masked] = -float("inf")
+
+                conf_flat = confidence.view(-1)
+                top_indices = torch.topk(conf_flat, k=num_to_unmask).indices
+
+                gen_flat = gen_section.view(-1)
+                sampled_flat = sampled_tokens.view(-1)
+
+                # Clone RHS slice to avoid any potential overlapping write issues
+                gen_flat[top_indices] = sampled_flat[top_indices].clone()
+                gen_section = gen_flat.view(batch_size, gen_length)
             else:
                 # Random remasking
-                num_to_unmask = min(tokens_per_step, is_masked.sum().item())
-                if num_to_unmask > 0:
-                    masked_indices = is_masked.nonzero(as_tuple=True)
-                    perm = torch.randperm(len(masked_indices[0]))[:num_to_unmask]
-                    for idx in perm:
-                        b, t = masked_indices[0][idx], masked_indices[1][idx]
-                        current_ids[b, prompt_length + t] = sampled_tokens[b, t]
-        
-        # Final pass: replace any remaining masks
-        gen_section = current_ids[:, prompt_length:]
-        is_masked = (gen_section == mask_token_id)
+                masked_positions = is_masked.nonzero(as_tuple=False)  # (N, 2) [b, t]
+                perm = torch.randperm(masked_positions.size(0), device=device)[
+                    :num_to_unmask
+                ]
+                chosen = masked_positions[perm]
+                b_idx = chosen[:, 0]
+                t_idx = chosen[:, 1]
+
+                # Again, assign from a distinct tensor
+                gen_section[b_idx, t_idx] = sampled_tokens[b_idx, t_idx].clone()
+
+            # Write the updated generation region back
+            current_ids[:, prompt_length:] = gen_section
+
+        # Final pass: fill any remaining masks
+        gen_section = current_ids[:, prompt_length:].clone()
+        is_masked = gen_section == mask_token_id
         if is_masked.any():
-            with torch.no_grad():
-                outputs = model(input_ids=current_ids, attention_mask=current_mask)
-                logits = outputs.logits[:, prompt_length:, :]
-                probs = torch.softmax(logits / max(temperature, 0.1), dim=-1)
-                final_tokens = torch.multinomial(
-                    probs.view(-1, probs.size(-1)),
-                    num_samples=1
-                ).view(batch_size, gen_length)
-                gen_section[is_masked] = final_tokens[is_masked]
-                current_ids[:, prompt_length:] = gen_section
-        
+            outputs = model(
+                input_ids=current_ids,
+                attention_mask=current_mask,
+            )
+            logits = outputs.logits[:, prompt_length:, :]
+            probs = torch.softmax(logits / max(temperature, 0.1), dim=-1)
+            probs_flat = probs.reshape(-1, probs.size(-1)).contiguous()
+            final_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
+            final_tokens = final_flat.view(batch_size, gen_length)
+
+            # Clone RHS slice before assigning with a boolean mask
+            gen_section[is_masked] = final_tokens[is_masked].clone()
+            current_ids[:, prompt_length:] = gen_section
+
         return current_ids
 
 
 class LLaDAPipeline(BasePipeline):
     """Inference pipeline for LLaDA 8B masked diffusion language model."""
-    
-    DEFAULT_MODEL = "GSAI-ML/LLaDA-8B-Instruct"
-    
+
+    # You can change this to Instruct if you want:
+    # DEFAULT_MODEL = "GSAI-ML/LLaDA-8B-Instruct"
+    DEFAULT_MODEL = "GSAI-ML/LLaDA-8B-Base"
+
     def __init__(
         self,
         model_name: str = DEFAULT_MODEL,
         device: str = "cuda",
-        torch_dtype: torch.dtype = torch.bfloat16
+        torch_dtype: torch.dtype = torch.bfloat16,
     ):
-        """
-        Initialize LLaDA pipeline.
-        
-        Args:
-            model_name: HuggingFace model identifier
-            device: Device to run inference on
-            torch_dtype: Data type for model weights
-        """
         super().__init__(model_name, device)
         self.torch_dtype = torch_dtype
-    
+
     def load_model(self) -> None:
-        """Load LLaDA model and tokenizer."""
         if self._is_loaded:
             return
-            
+
         print(f"Loading LLaDA model: {self.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
-            trust_remote_code=True
+            trust_remote_code=True,
         )
         self.model = AutoModel.from_pretrained(
             self.model_name,
             trust_remote_code=True,
-            torch_dtype=self.torch_dtype
+            torch_dtype=self.torch_dtype,
         )
         self.model = self.model.to(self.device).eval()
         self._is_loaded = True
         print("LLaDA model loaded successfully")
-    
+
     def generate(
         self,
         prompt: str,
@@ -226,69 +222,40 @@ class LLaDAPipeline(BasePipeline):
         top_p: float = 0.95,
         steps: Optional[int] = None,
         remasking: str = "low_confidence",
-        **kwargs
+        top_k: Optional[int] = None,
+        **kwargs,
     ) -> str:
         """
         Generate text using LLaDA's masked diffusion generation.
-        
-        Args:
-            prompt: Input text prompt
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling parameter
-            steps: Number of diffusion steps (default: max_new_tokens)
-            remasking: Remasking strategy ('low_confidence' or 'random')
-            **kwargs: Additional parameters
-            
-        Returns:
-            Generated text string
+
+        NOTE: we do NOT call `self.model.generate(...)` here, to avoid
+        the `model_kwargs` error for `steps` and to use LLaDA-style sampling.
         """
         if not self._is_loaded:
             self.load_model()
-        
+
         if steps is None:
             steps = max_new_tokens
-        
-        # Prepare input using chat template if available
-        if hasattr(self.tokenizer, 'apply_chat_template'):
+
+        # For Instruct models you might want chat templates; Base is fine with plain text.
+        if hasattr(self.tokenizer, "apply_chat_template"):
             messages = self._apply_chat_template(prompt)
             try:
                 text = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
-                    add_generation_prompt=True
+                    add_generation_prompt=True,
                 )
                 inputs = self.tokenizer(text, return_tensors="pt")
-            except:
+            except Exception:
                 inputs = self.tokenizer(prompt, return_tensors="pt")
         else:
             inputs = self.tokenizer(prompt, return_tensors="pt")
-        
+
         input_ids = inputs.input_ids.to(self.device)
         attention_mask = inputs.attention_mask.to(self.device)
-        
-        # Check if model has its own generate method
-        if hasattr(self.model, 'generate') and callable(getattr(self.model, 'generate')):
-            try:
-                with torch.no_grad():
-                    output_ids = self.model.generate(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        steps=steps,
-                        **kwargs
-                    )
-                # Decode output
-                generated_tokens = output_ids[0][len(input_ids[0]):].tolist()
-                generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                return generated_text.strip()
-            except TypeError:
-                # Model generate doesn't support these args, fallback
-                pass
-        
-        # Fallback to custom generation
+
+        # Always use custom diffusion generator – don't forward `steps` into HF generate()
         output_ids = LLaDAGenerate.generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -298,12 +265,15 @@ class LLaDAPipeline(BasePipeline):
             steps=steps,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             remasking=remasking,
-            device=self.device
+            device=self.device,
         )
-        
-        # Decode output (remove input tokens)
-        generated_tokens = output_ids[0][len(input_ids[0]):].tolist()
-        generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
+
+        generated_tokens = output_ids[0][len(input_ids[0]) :].tolist()
+        generated_text = self.tokenizer.decode(
+            generated_tokens,
+            skip_special_tokens=True,
+        )
+
         return generated_text.strip()
