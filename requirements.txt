@@ -1,4 +1,4 @@
 torch>=2.5.1
 transformers>=4.46.2
-datasets
+datasets==3.6.0
 accelerate
