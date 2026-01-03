@@ -76,7 +76,7 @@ def run_prompts(
     start_idx: int = 0,
     end_idx: Optional[int] = None,
     max_new_tokens: int = 512,
-    temperature: float = 0.7,
+    temperature: float = 0.2,
     custom_prompts: Optional[Dict[str, str]] = None,
     **generation_kwargs
 ) -> None:
@@ -230,8 +230,8 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature (default: 0.7)"
+        default=0.2,
+        help="Sampling temperature (default: 0.2)"
     )
     
     args = parser.parse_args()
@@ -239,7 +239,7 @@ def main():
     # Set default output path
     if args.output is None:
         args.output = f"results/{args.model}_results.json"
-    
+        
     # Parse prompt IDs
     prompt_ids = [p.strip() for p in args.prompt_ids.split(",")]
     

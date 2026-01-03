@@ -80,7 +80,7 @@ def run_experiment(
     data_path: str,
     output_dir: str,
     max_new_tokens: int = 512,
-    temperature: float = 0.7,
+    temperature: float = 0.2,
     start_idx: int = 0,
     end_idx: Optional[int] = None,
     prompt_ids: Optional[List[str]] = None,
@@ -263,8 +263,8 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature (default: 0.7)"
+        default=0.2,
+        help="Sampling temperature (default: 0.2)"
     )
     parser.add_argument(
         "--start-idx",
