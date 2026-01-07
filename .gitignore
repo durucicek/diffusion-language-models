@@ -21,8 +21,6 @@ ENV/
 # Data and results (large files)
 *.json
 !**/config*.json
-data_creation/data/wikipedia_samples.json
-data_creation/results/
 
 # Model cache
 .cache/
